@@ -1,0 +1,415 @@
+* A simple example of n+1 queries
+
+** code
+
+#+name: JkKuaYxxWXQ9UWAEh3G2tY
+#+begin_src haskell
+getAllUsernames :: Connection -> IO [Username]
+getAllUsernames conn = do
+  userIds <- getAllUserIds conn
+  for userIds $ \userId -> do
+    mUserName <- getUsernameById conn (fromOnly userId)
+    case mUserName of
+      Just un -> pure un
+      Nothing -> mzero
+
+getAllUserIds :: Connection -> IO [Only Int64]
+getAllUserIds conn = query_ conn "select id from users"
+
+getUsernameById :: Connection -> Int64 -> IO (Maybe Username)
+getUsernameById conn userId = fmap listToMaybe $ queryNamed
+  conn
+  "SELECT id,name from users where id = :id"
+  [":id" := userId]
+#+end_src
+
+
+** output from query log
+
+#+name: ndCsBnKBDYPnAKDW5G8jck
+#+begin_src sql
+select id from users
+SELECT id,name from users where id = 0
+SELECT id,name from users where id = 1
+SELECT id,name from users where id = 2
+#+end_src
+
+
+* An example with Haxl
+
+** code (post boilerplate)
+
+#+begin_src haskell
+getAllUserIdsH :: Haxl [Id]
+getAllUserIdsH = dataFetch GetAllIds
+
+getUsernameByIdH :: Id -> Haxl Name
+getUsernameByIdH userId = dataFetch (GetNameById userId)
+
+getAllUsernamesH :: Haxl [Name]
+getAllUsernamesH = do
+  userIds <- getAllUserIdsH
+  for userIds $ \userId -> do
+    getUsernameByIdH userId
+#+end_src
+
+
+** output for =N=3=
+
+#+begin_src sql
+select id from users
+SELECT name FROM (SELECT *, INSTR(',2,1,0,',','|| id || ',') POS FROM users)X WHERE POS>0 ORDER BY POS
+#+end_src
+
+
+* What does it get us besides eliminating the =n+1= query?
+
+** Better modularity? Huh?
+
+*** Here's how your code might be without Haxl
+
+When you have caching and eliminate =n+1= queries, you end up having to pass less ids. That's kind of tough to wrap ones head around (or was for me) so here's an example:
+
+#+begin_src haskell
+main = do
+  userIds <- getAllUserIds
+  updateAllUsers userIds
+  messageAllUsers usersIds "hi"
+
+getAllUserIds :: IO [UserId]
+updateAllUsers :: [UserId] -> IO [Users]
+updateAllUsers userIds = -- ... snip ...
+messageAllUsers :: [UserId] -> String -> IO ()
+messageAllUsers userIds = -- ... snip ...
+#+end_src
+
+
+*** With Haxl, your functions can stop caring about =[UserId]=
+
+#+begin_src haskell
+main = do
+  updateAllUsers
+  messageAllUsers "hi"
+
+getAllUserIds :: IO [UserId]
+updateAllUsers :: IO [Users]
+updateAllUsers = userIds <- getAllUserIds; -- ... snip ...
+messageAllUsers :: String -> IO ()
+messageAllUsers = userIds <- getAllUserIds; -- ... snip ...
+#+end_src
+
+
+*** Zooming in on that difference
+
+#+begin_src haskell
+updateAllUsers :: [UserId] -> IO [Users]
+updateAllUsers userIds = do
+  -- ... snip ...
+#+end_src
+
+#+begin_src haskell
+updateAllUsers :: IO [Users]
+updateAllUsers = do
+  userIds <- getAllUserIds
+  -- ... snip ...
+#+end_src
+
+
+** Full mocking and testing
+
+*** With a small modification to our example we can dump the full state out as valid Haskell
+
+#+begin_src haskell
+env0 <- initEnv stateStore conn
+void $ runHaxl env0 (getAllUsernamesH)
+str <- runHaxl env0 dumpCacheAsHaskell
+putStrLn str
+#+end_src
+
+Resulting in:
+
+#+begin_src haskell
+loadCache :: GenHaxl u w ()
+loadCache = do
+  cacheRequest (GetNameById 0) (Right ("Susy Thunder"))
+  cacheRequest (GetNameById 1) (Right ("Joe"))
+  cacheRequest (GetNameById 2) (Right ("Bob"))
+  cacheRequest (GetAllIds) (Right ([0,1,2]))
+#+end_src
+
+*** Imagine using this to debug production issues with the exact same data as prod
+
+**** Making regression tests based on production errors with the same local state that caused those errors
+
+****  Maybe sending the potentially large strings to S3
+
+* Cool, but what's necessary to get to that point?
+
+They are all necessary, but I'll cover the most important first.
+
+** A type to track the different queries
+
+For Haxl to optimize or "query plan", it needs to know how to differentiate between your different queries:
+
+#+begin_src haskell
+data UserReq a where
+  GetAllIds   ::UserReq [Id]
+  GetNameById ::Id -> UserReq Name
+  deriving (Typeable)
+#+end_src
+
+
+** A concrete (or monomorphic) =GenHaxl= instance for our case
+
+GenHaxl is defined:
+
+#+begin_src haskell
+newtype GenHaxl u w a = GenHaxl
+  { unHaxl :: Env u w -> IO (Result u w a) }
+#+end_src
+
+- u: User defined environmenet
+- w: Writer monad for 'WriteTree', useful for logs that respect Haxl cache unlike =print= or =Gluon.logLn=
+- a: Our output type (Here =[Id]= and =Name=) as seen in [[*A type to track the different queries][A type to track the different queries]]
+
+So we can define:
+
+#+begin_src haskell
+type Haxl = GenHaxl Connection ()
+#+end_src
+
+
+** DataSource Postgres.Connection UserReq (the big one)
+#+begin_src haskell
+instance DataSource Connection UserReq where
+  fetch _state _flags conn = SyncFetch $ \blockedFetches -> do
+
+    let
+      ids :: [Id]
+      vars :: [ResultVar Name]
+      (ids, vars) = do
+        unzip
+          [ (userId, r)
+          | BlockedFetch (GetNameById userId) r <- blockedFetches
+          ]
+
+      allIdVars :: [ResultVar [Id]]
+      allIdVars = [ r | BlockedFetch GetAllIds r <- blockedFetches ]
+
+      idStrings :: [T.Text]
+      idStrings = map (T.pack . show) ids
+
+    unless (null allIdVars) $ do
+      allIds <-
+        fmap (fmap fromOnly)
+          $ (query_ conn "select id from users" :: IO [Only Id])
+      mapM_ (\r -> putSuccess r allIds) allIdVars
+
+    unless (null ids) $ do
+      names <-
+        fmap (fmap fromOnly)
+        $ query_ conn
+        $ Query
+            (T.unwords
+              [ "SELECT name FROM (SELECT *,"
+              , "INSTR(',"
+              <> T.intercalate "," idStrings
+              <> ",',"
+              <> "','"
+              <> "|| id || ',')"
+              , "POS FROM users)X WHERE POS>0 ORDER BY POS"
+              ]
+            )
+      mapM_ (uncurry putSuccess) (zip vars names)
+#+end_src
+
+
+** Hold on... what's that weird =INSTR= sql query for? Is it necessary?
+
+Had we implemented with something more predictable:
+
+#+begin_src sql
+select name from users where name in ('name1', 'name2', ...)
+#+end_src
+
+Haxl would complain with =LogicBug ReadingCompletionsFailedRun=.
+
+By experimentation and the example I figured out this was due to the result set not preserving order. It makes intuitive sense that Haxl, which makes everything async, would care about ordering.
+
+
+** A very simple example of using =INSTR=
+
+Notice the different order of the result set for each query:
+
+#+begin_src sql
+  sqlite> select * from users where id in (2,0,1);
+  0|Susy Thunder
+  1|Joe
+  2|Bob
+#+end_src
+
+#+begin_src sql
+  sqlite> SELECT * FROM (
+            SELECT *, INSTR(',2,0,1,',','|| id || ',') POS FROM users) X
+          WHERE POS > 0 ORDER BY POS;
+  2|Bob|1
+  0|Susy Thunder|3
+  1|Joe|5
+#+end_src
+
+
+
+** Note many of these examples use StandaloneDeriving which our style guide avoids
+
+I think these are necessary for GADTs like our =UserReq= definition above, but perhaps they can be avoided if we want?
+
+
+** And 5 other instances
+
+*** TODO Show
+
+Necessary for caching because caching requires serialization.
+
+I worry about performance of =show= here, but they say they're using it at Facebook scale so maybe it's fine.
+
+#+begin_src haskell
+deriving instance Show (UserReq a)
+#+end_src
+
+
+*** TODO Hashable
+
+Suspicious salt in the example I cribbed this from O_o
+
+#+begin_src haskell
+instance Hashable (UserReq a) where
+  hashWithSalt s GetAllIds       = hashWithSalt s (0 :: Int)
+  hashWithSalt s (GetNameById a) = hashWithSalt s (1 :: Int, a)
+#+end_src
+
+
+*** TODO ShowP
+
+No idea what this is for.
+
+#+begin_src haskell
+instance ShowP UserReq where
+  showp = show
+#+end_src
+
+
+*** TODO StateKey
+
+Not quite sure how this is used.
+
+#+begin_src haskell
+instance StateKey UserReq where
+  data State UserReq = UserState {}
+#+end_src
+
+
+*** TODO DataSourceName
+
+Used for things like logging (and maybe other stuff).
+
+#+begin_src haskell
+instance DataSourceName UserReq where
+  dataSourceName _ = "UserDataSource"
+#+end_src
+
+
+* notes/misc things
+
+** ApplicativeDo can get complicated
+https://youtu.be/hF1enHn54e8?t=1971
+
+
+** we use =for= from =Data.Traversable= rather than =forM= which you might see more in Smurf
+
+
+** Using haxl to solve n+1 queries requires =Select * from x where y in (0,1,2...)= but following user-specified order of =in=
+
+This is done in most databases using the =order by find_in_set(y, (0,1,2...))= pattern
+
+But if your database (sqlite) doesn't have =find_in_set= you get to have fun and do this:
+
+#+begin_src sql
+    sqlite> select * from users where id in (2,0,1);
+    0|Susy Thunder
+    1|Joe
+    2|Bob
+    sqlite> SELECT * FROM (
+              SELECT *, INSTR(',2,0,1,',','|| id || ',') POS FROM users) X
+            WHERE POS > 0 ORDER BY POS;
+    2|Bob|1
+    0|Susy Thunder|3
+    1|Joe|5
+#+end_src
+
+[[https://stackoverflow.com/a/67397081][source: StackOverflow]]
+
+
+** improved modularity
+
+*** https://youtu.be/hF1enHn54e8
+
+
+*** my example
+
+#+begin_src markdown
+Wow, so apparently Haxl also has a "per request" cache that means you can avoid having to pass down data to other functions with no performance impact:
+
+instead of having the typical way of passing user ids in from the calling function:
+
+```haskell
+main = do
+  userIds <- getAllUserIds
+  updateAllUsers userIds
+  messageAllUsers usersIds "hi"
+
+getAllUserIds :: IO [UserId]
+updateAllUsers :: [UserId] -> IO [Users]
+updateAllUsers userIds = -- ... snip ...
+messageAllUsers :: [UserId] -> String -> IO ()
+messageAllUsers userIds = -- ... snip ...
+```
+
+You can ignore the semantics of the caller (`main` here) of the current function (`updateAllUsers` and `messageAllUsers` here) and rely totally on local reasoning:
+
+```haskell
+main = do
+  updateAllUsers
+  messageAllUsers "hi"
+
+getAllUserIds :: IO [UserId]
+updateAllUsers :: IO [Users]
+updateAllUsers = userIds <- getAllUserIds; -- ... snip ...
+messageAllUsers :: String -> IO ()
+messageAllUsers = userIds <- getAllUserIds; -- ... snip ...
+```
+
+And because the results of `getAllUserIds` is cached for that request, it would be the same performance as the first.
+
+Plus, there's a lot less noise especially when you pass in lots of arguments.
+
+Noticed at the caching section of https://www.youtube.com/watch?v=sT6VJkkhy0o
+#+end_src
+
+
+* other Haxl examples from Github
+
+*** [[https://github.com/2049foundation/clickhouse-haskell][Haskell driver for Clickhouse open-source column-oriented DBMS]]
+
+
+*** https://github.com/JiriLojda/kontent-haskell-graphql-proxy
+
+
+*** [[https://github.com/plow-technologies/presentation-tutorials/blob/9282e0ab6c3a52dc956ff326c8011a247a6dfd6d/onping-architecture/haxl-example/src/Lib.hs][Example that *does not solve n+1 queries* but has a nice code style]]
+
+At least I don't think it does
+
+
+*** https://github.com/periodic/LoLScouting
+
+
+*** https://github.com/nalchevanidze/morpheus-haxl-example

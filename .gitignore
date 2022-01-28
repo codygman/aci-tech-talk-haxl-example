@@ -1,0 +1,14 @@
+.stack-work/*
+*.cabal
+dist
+dist-newstyle
+*.hie
+
+.DS_Store
+*.swp
+
+.tags
+TAGS
+tags
+
+/test.db
